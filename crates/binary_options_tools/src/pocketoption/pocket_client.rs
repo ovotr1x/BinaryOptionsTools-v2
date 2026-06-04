@@ -412,6 +412,7 @@ impl PocketOption {
         // Fix #4: Duplicate Trade Prevention
         let fingerprint = (asset_str.clone(), action, time, amount);
         let request_id = Uuid::new_v4();
+        let wire_request_id = crate::pocketoption::types::generate_wire_request_id();
 
         {
             let mut recent = self.client.state.trade_state.recent_trades.write().await;
@@ -446,7 +447,7 @@ impl PocketOption {
                 action,
                 time,
                 self.is_demo() as u32,
-                request_id,
+                wire_request_id,
             );
             self.client
                 .state
@@ -484,7 +485,14 @@ impl PocketOption {
         };
 
         let deal_result = handle
-            .trade_with_id(asset_str.clone(), action, amount, time, request_id)
+            .trade_with_id(
+                asset_str.clone(),
+                action,
+                amount,
+                time,
+                request_id,
+                wire_request_id,
+            )
             .await;
 
         match deal_result {

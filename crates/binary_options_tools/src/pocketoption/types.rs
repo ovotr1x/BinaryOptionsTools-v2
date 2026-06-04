@@ -2,7 +2,8 @@ use core::fmt;
 use std::hash::Hash;
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use binary_options_tools_core::{reimports::Message, traits::Rule};
@@ -535,6 +536,35 @@ pub struct FailOpenOrder {
     pub asset: String,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RequestId {
+    Uuid(Uuid),
+    Number(u64),
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestId::Uuid(id) => write!(f, "{id}"),
+            RequestId::Number(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+static WIRE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn generate_wire_request_id() -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let counter = WIRE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000;
+
+    10_000_000 + ((now_ms * 1_000 + counter) % 90_000_000)
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenOrder {
@@ -544,7 +574,7 @@ pub struct OpenOrder {
     pub amount: Decimal,
     pub is_demo: u32,
     pub option_type: u32,
-    pub request_id: Uuid,
+    pub request_id: u64,
     pub time: u32,
 }
 
@@ -561,7 +591,8 @@ pub struct Deal {
     pub refund_time: Option<Value>,
     pub refund_timestamp: Option<Value>,
     pub uid: u64,
-    pub request_id: Option<Uuid>,
+    #[serde(default)]
+    pub request_id: Option<RequestId>,
     pub amount: Decimal,
     pub profit: Decimal,
     pub percent_profit: i32,
@@ -601,7 +632,7 @@ impl OpenOrder {
         action: Action,
         duration: u32,
         demo: u32,
-        request_id: Uuid,
+        request_id: u64,
     ) -> Self {
         Self {
             amount,
@@ -813,7 +844,7 @@ mod tests {
             Action::Call,
             60,
             1,
-            Uuid::new_v4(),
+            18_396_039,
         );
         let formatted = format!("{order}");
         assert!(formatted.starts_with("42[\"openOrder\","));

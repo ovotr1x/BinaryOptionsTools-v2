@@ -118,23 +118,25 @@ impl DealsApiModule {
                 }
                 Err(e) => warn!("Failed to parse UpdateOpenedDeals (text): {:?}", e),
             },
-            ExpectedMessage::UpdateClosedDeals => match serde_json::from_str::<Vec<Deal>>(text) {
-                Ok(deals) => {
-                    self.state
-                        .trade_state
-                        .update_closed_deals(deals.clone())
-                        .await;
-                    for deal in deals {
-                        if let Some(waiters) = self.waiting_requests.remove(&deal.id) {
-                            info!("Trade closed: {:?}", deal);
-                            for tx in waiters {
-                                let _ = tx.send(Ok(deal.clone()));
+            ExpectedMessage::UpdateClosedDeals => {
+                match serde_json::from_str::<Vec<Deal>>(text) {
+                    Ok(deals) => {
+                        self.state
+                            .trade_state
+                            .update_closed_deals(deals.clone())
+                            .await;
+                        for deal in deals {
+                            if let Some(waiters) = self.waiting_requests.remove(&deal.id) {
+                                info!("Trade closed: {:?}", deal);
+                                for tx in waiters {
+                                    let _ = tx.send(Ok(deal.clone()));
+                                }
                             }
                         }
                     }
+                    Err(e) => warn!("Failed to parse UpdateClosedDeals (text): {:?}", e),
                 }
-                Err(e) => warn!("Failed to parse UpdateClosedDeals (text): {:?}", e),
-            },
+            }
             ExpectedMessage::SuccessCloseOrder => {
                 // Try parsing as CloseOrder struct first
                 match serde_json::from_str::<CloseOrder>(text) {
