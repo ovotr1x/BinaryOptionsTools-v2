@@ -19,7 +19,10 @@ use uuid::Uuid;
 use crate::pocketoption::{
     error::{PocketError, PocketResult},
     state::State,
-    types::{Action, Deal, FailOpenOrder, MultiPatternRule, OpenOrder},
+    types::{
+        generate_wire_request_id, Action, Deal, FailOpenOrder, MultiPatternRule, OpenOrder,
+        RequestId,
+    },
 };
 
 /// Command enum for the `TradesApiModule`.
@@ -32,6 +35,7 @@ pub enum Command {
         amount: Decimal,
         time: u32,
         req_id: Uuid,
+        wire_req_id: u64,
         responder: oneshot::Sender<PocketResult<Deal>>,
     },
 }
@@ -72,8 +76,15 @@ impl TradesHandle {
         amount: Decimal,
         time: u32,
     ) -> PocketResult<Deal> {
-        self.trade_with_id(asset, action, amount, time, Uuid::new_v4())
-            .await
+        self.trade_with_id(
+            asset,
+            action,
+            amount,
+            time,
+            Uuid::new_v4(),
+            generate_wire_request_id(),
+        )
+        .await
     }
 
     /// Places a new trade with a specific request ID.
@@ -84,6 +95,7 @@ impl TradesHandle {
         amount: Decimal,
         time: u32,
         req_id: Uuid,
+        wire_req_id: u64,
     ) -> PocketResult<Deal> {
         let (tx, rx) = oneshot::channel();
 
@@ -94,6 +106,7 @@ impl TradesHandle {
                 amount,
                 time,
                 req_id,
+                wire_req_id,
                 responder: tx,
             })
             .await
@@ -133,6 +146,7 @@ pub struct TradesApiModule {
     message_receiver: AsyncReceiver<Arc<Message>>,
     to_ws_sender: AsyncSender<Message>,
     pending_orders: HashMap<Uuid, PendingOrderTracker>,
+    wire_to_internal: HashMap<u64, Uuid>,
     // Secondary index for matching failures (which lack UUID)
     // Map of (Asset, Amount) -> Queue of UUIDs (FIFO)
     /// A heuristic-based mapping for correlating server-side failures to client requests.
@@ -167,6 +181,7 @@ impl ApiModule<State> for TradesApiModule {
             message_receiver,
             to_ws_sender,
             pending_orders: HashMap::new(),
+            wire_to_internal: HashMap::new(),
             failure_matching: HashMap::new(),
         }
     }
@@ -186,7 +201,7 @@ impl ApiModule<State> for TradesApiModule {
             select! {
               cmd_res = self.command_receiver.recv() => {
                   match cmd_res {
-                      Ok(Command::OpenOrder { asset, action, amount, time, req_id, responder }) => {
+                      Ok(Command::OpenOrder { asset, action, amount, time, req_id, wire_req_id, responder }) => {
                           // Register pending order
                           let tracker = PendingOrderTracker {
                               asset: asset.clone(),
@@ -194,6 +209,7 @@ impl ApiModule<State> for TradesApiModule {
                               responder,
                           };
                           self.pending_orders.insert(req_id, tracker);
+                          self.wire_to_internal.insert(wire_req_id, req_id);
 
                           // Add to failure matching queue
                           let key = (asset.clone(), amount);
@@ -201,11 +217,12 @@ impl ApiModule<State> for TradesApiModule {
 
                           // Create OpenOrder and send to WebSocket.
                           let asset_for_error = asset.clone();
-                          let order = OpenOrder::new(amount, asset, action, time, self.state.is_demo() as u32, req_id);
+                          let order = OpenOrder::new(amount, asset, action, time, self.state.is_demo() as u32, wire_req_id);
                           if let Err(e) = self.to_ws_sender.send(Message::text(order.to_string())).await {
                               if let Some(tracker) = self.pending_orders.remove(&req_id) {
                                   let _ = tracker.responder.send(Err(CoreError::from(e).into()));
                               }
+                              self.wire_to_internal.remove(&wire_req_id);
                               let key = (asset_for_error, amount);
                               if let Some(queue) = self.failure_matching.get_mut(&key) {
                                   queue.retain(|&id| id != req_id);
@@ -254,23 +271,46 @@ impl ApiModule<State> for TradesApiModule {
                               self.state.trade_state.add_opened_deal(*deal.clone()).await;
                               info!(target: "TradesApiModule", "Trade opened: {}", deal.id);
 
-                              let req_id = deal.request_id.unwrap_or_default();
-
-                              // Clean up pending_market_orders in state
-                              self.state.trade_state.pending_market_orders.write().await.remove(&req_id);
-
-                              if let Some(tracker) = self.pending_orders.remove(&req_id) {
-                                  let _ = tracker.responder.send(Ok(*deal.clone()));
-
-                                  let key = (tracker.asset, tracker.amount);
-                                  if let Some(queue) = self.failure_matching.get_mut(&key) {
-                                      queue.retain(|&id| id != req_id);
-                                      if queue.is_empty() {
+                              let req_id = match deal.request_id.as_ref() {
+                                  Some(RequestId::Uuid(id)) => Some(*id),
+                                  Some(RequestId::Number(id)) => self.wire_to_internal.remove(id),
+                                  None => {
+                                      let key = (deal.asset.clone(), deal.amount);
+                                      let req_id = self
+                                          .failure_matching
+                                          .get_mut(&key)
+                                          .and_then(|queue| queue.pop_front());
+                                      if matches!(self.failure_matching.get(&key), Some(queue) if queue.is_empty()) {
                                           self.failure_matching.remove(&key);
                                       }
+                                      req_id
+                                  }
+                              };
+
+                              if let Some(req_id) = req_id {
+                                  // Clean up pending_market_orders in state
+                                  self.state.trade_state.pending_market_orders.write().await.remove(&req_id);
+
+                                  if let Some(tracker) = self.pending_orders.remove(&req_id) {
+                                      let _ = tracker.responder.send(Ok(*deal.clone()));
+
+                                      let key = (tracker.asset, tracker.amount);
+                                      if let Some(queue) = self.failure_matching.get_mut(&key) {
+                                          queue.retain(|&id| id != req_id);
+                                          if queue.is_empty() {
+                                              self.failure_matching.remove(&key);
+                                          }
+                                      }
+                                  } else {
+                                      warn!(target: "TradesApiModule", "Received success for unknown request ID: {}", req_id);
                                   }
                               } else {
-                                  warn!(target: "TradesApiModule", "Received success for unknown request ID: {}", req_id);
+                                  warn!(
+                                      target: "TradesApiModule",
+                                      "Could not correlate successopenOrder for {} {}",
+                                      deal.asset,
+                                      deal.amount
+                                  );
                               }
                           }
                           ServerResponse::Fail(fail) => {
@@ -315,7 +355,7 @@ impl ApiModule<State> for TradesApiModule {
         // This rule will match messages like:
         // 451-["successopenOrder",...]
         // 451-["failopenOrder",...]
-        
+
         Box::new(MultiPatternRule::new(vec![
             "successopenOrder",
             "failopenOrder",

@@ -19,12 +19,13 @@ use crate::pocketoption::types::Outgoing;
 use crate::{
     error::BinaryOptionsError,
     pocketoption::{
-        candle::{compile_candles_from_tuples, Candle, SubscriptionType},
+        candle::{compile_candles_from_tuples, Candle, HistoryPoint, SubscriptionType},
         connect::PocketConnect,
         error::{PocketError, PocketResult},
         modules::{
             assets::AssetsModule,
             balance::BalanceModule,
+            chart_stream::{ChartStreamApiModule, HistoryStreamEvent, HistoryStreamMode},
             deals::DealsApiModule,
             get_candles::GetCandlesApiModule,
             historical_data::HistoricalDataApiModule,
@@ -122,6 +123,7 @@ impl PocketOption {
             .with_module::<GetCandlesApiModule>()
             .with_module::<PendingTradesApiModule>()
             .with_module::<HistoricalDataApiModule>()
+            .with_module::<ChartStreamApiModule>()
             .with_module::<RawApiModule>()
             .with_lightweight_handler(|msg, _, _| Box::pin(print_handler(msg)))
             .on_reconnect(Box::new(TradeReconciliationCallback))
@@ -352,6 +354,28 @@ impl PocketOption {
         Ok(history_stream.chain(live_stream))
     }
 
+    /// Opens an early/lazy chart stream with one `changeSymbol` request.
+    ///
+    /// The stream emits the selected history bootstrap (`points` or `ohlc`) and
+    /// then continues with matching `updateStream` rows for the same asset. This
+    /// helper intentionally does not alter the normal subscribe/unsubscribe
+    /// lifecycle.
+    pub async fn subscribe_with_history_mode(
+        &self,
+        asset: impl Into<String>,
+        period: u32,
+        mode: HistoryStreamMode,
+    ) -> PocketResult<impl futures_util::Stream<Item = PocketResult<HistoryStreamEvent>> + 'static>
+    {
+        let handle = self
+            .require_handle::<ChartStreamApiModule>("ChartStreamApiModule")
+            .await?;
+        handle
+            .subscribe_with_history_mode(asset.into(), period, mode)
+            .await
+            .map(|stream| stream.to_stream())
+    }
+
     /// Validates if an asset is active and supports the given timeframe without cloning the entire assets map.
     pub async fn validate_asset(&self, asset: &str, time: u32) -> PocketResult<()> {
         let state = &self.client.state;
@@ -412,6 +436,7 @@ impl PocketOption {
         // Fix #4: Duplicate Trade Prevention
         let fingerprint = (asset_str.clone(), action, time, amount);
         let request_id = Uuid::new_v4();
+        let wire_request_id = crate::pocketoption::types::generate_wire_request_id();
 
         {
             let mut recent = self.client.state.trade_state.recent_trades.write().await;
@@ -446,7 +471,7 @@ impl PocketOption {
                 action,
                 time,
                 self.is_demo() as u32,
-                request_id,
+                wire_request_id,
             );
             self.client
                 .state
@@ -484,7 +509,14 @@ impl PocketOption {
         };
 
         let deal_result = handle
-            .trade_with_id(asset_str.clone(), action, amount, time, request_id)
+            .trade_with_id(
+                asset_str.clone(),
+                action,
+                amount,
+                time,
+                request_id,
+                wire_request_id,
+            )
             .await;
 
         match deal_result {
@@ -896,6 +928,44 @@ impl PocketOption {
     /// Deprecated: use `candles()` instead.
     pub async fn history(&self, asset: impl ToString, period: u32) -> PocketResult<Vec<Candle>> {
         self.candles(asset, period).await
+    }
+
+    /// Gets Pocket-style merged history points for a specific asset and period.
+    pub async fn history_points(
+        &self,
+        asset: impl ToString,
+        period: u32,
+    ) -> PocketResult<Vec<HistoryPoint>> {
+        let handle = self
+            .require_handle::<HistoricalDataApiModule>("HistoricalDataApiModule")
+            .await?;
+        let asset_str = asset.to_string();
+
+        if let Some(assets) = self.assets().await {
+            if assets.get(&asset_str).is_none() {
+                return Err(PocketError::InvalidAsset(asset_str));
+            }
+        }
+        handle.history_points(asset_str, period).await
+    }
+
+    /// Gets closed OHLC candles from Pocket Option's merged history flow.
+    pub async fn history_ohlc(
+        &self,
+        asset: impl ToString,
+        period: u32,
+    ) -> PocketResult<Vec<Candle>> {
+        let handle = self
+            .require_handle::<HistoricalDataApiModule>("HistoricalDataApiModule")
+            .await?;
+        let asset_str = asset.to_string();
+
+        if let Some(assets) = self.assets().await {
+            if assets.get(&asset_str).is_none() {
+                return Err(PocketError::InvalidAsset(asset_str));
+            }
+        }
+        handle.history_ohlc(asset_str, period).await
     }
 
     /// Compiles custom candlesticks from raw tick history.

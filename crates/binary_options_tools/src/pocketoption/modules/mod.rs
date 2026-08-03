@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod balance;
+pub mod chart_stream;
 pub mod deals;
 pub mod get_candles;
 pub mod historical_data;

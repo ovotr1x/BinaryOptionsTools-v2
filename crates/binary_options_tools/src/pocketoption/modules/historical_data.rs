@@ -13,7 +13,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::pocketoption::{
-    candle::{compile_candles_from_ticks, BaseCandle, Candle, CandleItem, HistoryItem},
+    candle::{
+        compile_candles_from_ticks, merge_history_ohlc, merge_history_points, BaseCandle, Candle,
+        CandleItem, HistoryItem, HistoryPoint,
+    },
     error::{PocketError, PocketResult},
     state::State,
     types::MultiPatternRule,
@@ -34,6 +37,16 @@ pub enum Command {
         period: u32,
         req_id: Uuid,
     },
+    GetHistoryPoints {
+        asset: String,
+        period: u32,
+        req_id: Uuid,
+    },
+    GetHistoryOhlc {
+        asset: String,
+        period: u32,
+        req_id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +56,14 @@ pub enum CommandResponse {
         ticks: Vec<(i64, f64)>,
     },
     Candles {
+        req_id: Uuid,
+        candles: Vec<Candle>,
+    },
+    HistoryPoints {
+        req_id: Uuid,
+        points: Vec<HistoryPoint>,
+    },
+    HistoryOhlc {
         req_id: Uuid,
         candles: Vec<Candle>,
     },
@@ -134,7 +155,11 @@ impl HistoricalDataHandle {
                         continue;
                     }
                 }
-                Ok(Ok(CommandResponse::Candles { .. })) => {
+                Ok(Ok(
+                    CommandResponse::Candles { .. }
+                    | CommandResponse::HistoryPoints { .. }
+                    | CommandResponse::HistoryOhlc { .. },
+                )) => {
                     // If we got candles but wanted ticks, we might be in trouble if we don't handle it.
                     // But usually the actor handles the response type.
                     continue;
@@ -199,7 +224,11 @@ impl HistoricalDataHandle {
                         continue;
                     }
                 }
-                Ok(Ok(CommandResponse::Ticks { .. })) => {
+                Ok(Ok(
+                    CommandResponse::Ticks { .. }
+                    | CommandResponse::HistoryPoints { .. }
+                    | CommandResponse::HistoryOhlc { .. },
+                )) => {
                     continue;
                 }
                 Ok(Ok(CommandResponse::Error(e))) => return Err(PocketError::General(e)),
@@ -207,6 +236,120 @@ impl HistoricalDataHandle {
                 Err(_) => {
                     return Err(PocketError::Timeout {
                         task: "candles".to_string(),
+                        context: format!("asset: {}, period: {}", asset, period),
+                        duration: HISTORICAL_DATA_TIMEOUT,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Retrieves the same merged point stream Pocket Option builds for its chart edge.
+    pub async fn history_points(
+        &self,
+        asset: String,
+        period: u32,
+    ) -> PocketResult<Vec<HistoryPoint>> {
+        let _guard = self.call_lock.lock().await;
+
+        let id = Uuid::new_v4();
+        self.sender
+            .send(Command::GetHistoryPoints {
+                asset: asset.clone(),
+                period,
+                req_id: id,
+            })
+            .await
+            .map_err(CoreError::from)?;
+        let mut mismatch_count = 0;
+        loop {
+            match timeout(HISTORICAL_DATA_TIMEOUT, self.receiver.recv()).await {
+                Ok(Ok(CommandResponse::HistoryPoints { req_id, points })) => {
+                    if req_id == id {
+                        return Ok(points);
+                    } else {
+                        warn!("Received response for unknown req_id: {}", req_id);
+                        mismatch_count += 1;
+                        if mismatch_count >= MAX_MISMATCH_RETRIES {
+                            return Err(PocketError::Timeout {
+                                task: "history_points".to_string(),
+                                context: format!(
+                                    "asset: {}, period: {}, exceeded mismatch retries",
+                                    asset, period
+                                ),
+                                duration: HISTORICAL_DATA_TIMEOUT,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                Ok(Ok(
+                    CommandResponse::Ticks { .. }
+                    | CommandResponse::Candles { .. }
+                    | CommandResponse::HistoryOhlc { .. },
+                )) => {
+                    continue;
+                }
+                Ok(Ok(CommandResponse::Error(e))) => return Err(PocketError::General(e)),
+                Ok(Err(e)) => return Err(CoreError::from(e).into()),
+                Err(_) => {
+                    return Err(PocketError::Timeout {
+                        task: "history_points".to_string(),
+                        context: format!("asset: {}, period: {}", asset, period),
+                        duration: HISTORICAL_DATA_TIMEOUT,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Retrieves closed OHLC candles from Pocket Option's merged chart history flow.
+    pub async fn history_ohlc(&self, asset: String, period: u32) -> PocketResult<Vec<Candle>> {
+        let _guard = self.call_lock.lock().await;
+
+        let id = Uuid::new_v4();
+        self.sender
+            .send(Command::GetHistoryOhlc {
+                asset: asset.clone(),
+                period,
+                req_id: id,
+            })
+            .await
+            .map_err(CoreError::from)?;
+        let mut mismatch_count = 0;
+        loop {
+            match timeout(HISTORICAL_DATA_TIMEOUT, self.receiver.recv()).await {
+                Ok(Ok(CommandResponse::HistoryOhlc { req_id, candles })) => {
+                    if req_id == id {
+                        return Ok(candles);
+                    } else {
+                        warn!("Received response for unknown req_id: {}", req_id);
+                        mismatch_count += 1;
+                        if mismatch_count >= MAX_MISMATCH_RETRIES {
+                            return Err(PocketError::Timeout {
+                                task: "history_ohlc".to_string(),
+                                context: format!(
+                                    "asset: {}, period: {}, exceeded mismatch retries",
+                                    asset, period
+                                ),
+                                duration: HISTORICAL_DATA_TIMEOUT,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                Ok(Ok(
+                    CommandResponse::Ticks { .. }
+                    | CommandResponse::Candles { .. }
+                    | CommandResponse::HistoryPoints { .. },
+                )) => {
+                    continue;
+                }
+                Ok(Ok(CommandResponse::Error(e))) => return Err(PocketError::General(e)),
+                Ok(Err(e)) => return Err(CoreError::from(e).into()),
+                Err(_) => {
+                    return Err(PocketError::Timeout {
+                        task: "history_ohlc".to_string(),
                         context: format!("asset: {}, period: {}", asset, period),
                         duration: HISTORICAL_DATA_TIMEOUT,
                     });
@@ -225,6 +368,8 @@ impl HistoricalDataHandle {
 enum RequestType {
     Ticks,
     Candles,
+    HistoryPoints,
+    HistoryOhlc,
 }
 
 /// This API module handles historical data requests.
@@ -318,6 +463,38 @@ impl ApiModule<State> for HistoricalDataApiModule {
                             let msg = format!("42{}", serialized_payload);
                             self.to_ws_sender.send(Message::text(msg)).await?;
                         }
+                        Command::GetHistoryPoints { asset, period, req_id } => {
+                            if self.pending_request.is_some() {
+                                warn!(target: "HistoricalDataApiModule", "Overwriting a pending request. Concurrent calls are not supported.");
+                            }
+                            self.pending_request = Some((req_id, asset.clone(), period, RequestType::HistoryPoints));
+                            let payload = serde_json::json!([
+                                "changeSymbol",
+                                {
+                                    "asset": asset,
+                                    "period": period
+                                }
+                            ]);
+                            let serialized_payload = serde_json::to_string(&payload)?;
+                            let msg = format!("42{}", serialized_payload);
+                            self.to_ws_sender.send(Message::text(msg)).await?;
+                        }
+                        Command::GetHistoryOhlc { asset, period, req_id } => {
+                            if self.pending_request.is_some() {
+                                warn!(target: "HistoricalDataApiModule", "Overwriting a pending request. Concurrent calls are not supported.");
+                            }
+                            self.pending_request = Some((req_id, asset.clone(), period, RequestType::HistoryOhlc));
+                            let payload = serde_json::json!([
+                                "changeSymbol",
+                                {
+                                    "asset": asset,
+                                    "period": period
+                                }
+                            ]);
+                            let serialized_payload = serde_json::to_string(&payload)?;
+                            let msg = format!("42{}", serialized_payload);
+                            self.to_ws_sender.send(Message::text(msg)).await?;
+                        }
                     }
                 },
                 Ok(msg) = self.message_receiver.recv() => {
@@ -359,7 +536,7 @@ impl ApiModule<State> for HistoricalDataApiModule {
                     if let Some(response) = response {
                         match response {
                             ServerResponse::Success(candles) => {
-                                if let Some((req_id, _, _, req_type)) = self.pending_request.take() {
+                                if let Some((req_id, asset, _, req_type)) = self.pending_request.take() {
                                     match req_type {
                                         RequestType::Candles => {
                                             self.command_responder.send(CommandResponse::Candles {
@@ -373,6 +550,26 @@ impl ApiModule<State> for HistoricalDataApiModule {
                                             self.command_responder.send(CommandResponse::Ticks {
                                                 req_id,
                                                 ticks,
+                                            }).await?;
+                                        }
+                                        RequestType::HistoryPoints => {
+                                            let points = candles
+                                                .iter()
+                                                .map(|c| HistoryPoint {
+                                                    asset: asset.clone(),
+                                                    time: c.timestamp as f64,
+                                                    price: c.close.to_f64().unwrap_or_default(),
+                                                })
+                                                .collect();
+                                            self.command_responder.send(CommandResponse::HistoryPoints {
+                                                req_id,
+                                                points,
+                                            }).await?;
+                                        }
+                                        RequestType::HistoryOhlc => {
+                                            self.command_responder.send(CommandResponse::HistoryOhlc {
+                                                req_id,
+                                                candles,
                                             }).await?;
                                         }
                                     }
@@ -399,6 +596,34 @@ impl ApiModule<State> for HistoricalDataApiModule {
                                         continue;
                                     };
                                     let symbol = history_response.asset;
+
+                                    if req_type == RequestType::HistoryPoints {
+                                        let points = merge_history_points(
+                                            &symbol,
+                                            history_response.period,
+                                            history_response.history.as_deref(),
+                                            history_response.candles.as_deref(),
+                                        );
+                                        self.command_responder.send(CommandResponse::HistoryPoints {
+                                            req_id,
+                                            points,
+                                        }).await?;
+                                        continue;
+                                    }
+
+                                    if req_type == RequestType::HistoryOhlc {
+                                        let candles = merge_history_ohlc(
+                                            &symbol,
+                                            history_response.period,
+                                            history_response.history.as_deref(),
+                                            history_response.candles.as_deref(),
+                                        );
+                                        self.command_responder.send(CommandResponse::HistoryOhlc {
+                                            req_id,
+                                            candles,
+                                        }).await?;
+                                        continue;
+                                    }
 
                                     // Extract ticks first if available
                                     let mut ticks = Vec::new();

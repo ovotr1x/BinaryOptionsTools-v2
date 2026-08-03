@@ -1,6 +1,6 @@
 #![allow(clippy::items_after_test_module)]
 
-use std::time::Duration;
+use std::{cmp::Ordering, time::Duration};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::{
@@ -119,22 +119,187 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    pub fn to_tick(&self) -> (i64, f64) {
+    pub fn to_point(&self) -> (f64, f64) {
         match self {
             HistoryItem::Tick([t, p]) => (
-                t.as_f64().unwrap_or_default() as i64,
+                t.as_f64().unwrap_or_default(),
                 p.as_f64().unwrap_or_default(),
             ),
             HistoryItem::TickWithNull([t, p, _]) => (
-                t.as_f64().unwrap_or_default() as i64,
+                t.as_f64().unwrap_or_default(),
                 p.as_f64().unwrap_or_default(),
             ),
         }
+    }
+
+    pub fn to_tick(&self) -> (i64, f64) {
+        let (timestamp, price) = self.to_point();
+        (timestamp as i64, price)
     }
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct CandleItem(pub f64, pub f64, pub f64, pub f64, pub f64, pub f64); // timestamp, open, close, high, low, volume
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryPoint {
+    pub asset: String,
+    pub time: f64,
+    pub price: f64,
+}
+
+pub fn merge_history_points(
+    asset: &str,
+    period: u32,
+    history: Option<&[HistoryItem]>,
+    candles: Option<&[CandleItem]>,
+) -> Vec<HistoryPoint> {
+    let mut points: Vec<(f64, f64)> = history
+        .unwrap_or_default()
+        .iter()
+        .map(HistoryItem::to_point)
+        .filter(|(time, price)| time.is_finite() && price.is_finite())
+        .collect();
+
+    if period >= 5 {
+        if let Some(candle_items) = candles {
+            let history_times: Vec<f64> = points.iter().map(|(time, _)| *time).collect();
+            let max_history_time =
+                history_times
+                    .iter()
+                    .copied()
+                    .reduce(|max, time| if time > max { time } else { max });
+
+            let synthetic_points = candle_items.iter().flat_map(|candle| {
+                [
+                    (candle.0, candle.1),
+                    (candle.0 + 1.0, candle.3),
+                    (candle.0 + 2.0, candle.4),
+                    (candle.0 + period as f64 - 1.0, candle.2),
+                ]
+            });
+
+            for (time, price) in synthetic_points {
+                if !time.is_finite() || !price.is_finite() {
+                    continue;
+                }
+                if let Some(max_time) = max_history_time {
+                    if time >= max_time || history_times.iter().any(|existing| *existing == time) {
+                        continue;
+                    }
+                }
+                points.push((time, price));
+            }
+        }
+    }
+
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    points
+        .into_iter()
+        .map(|(time, price)| HistoryPoint {
+            asset: asset.to_string(),
+            time,
+            price,
+        })
+        .collect()
+}
+
+/// Builds closed OHLC candles from the same merged point stream Pocket Option
+/// uses at the chart edge.
+///
+/// The newest bucket is intentionally dropped because the history side of
+/// `updateHistoryNewFast` can contain the currently developing candle.
+pub fn merge_history_ohlc(
+    asset: &str,
+    period: u32,
+    history: Option<&[HistoryItem]>,
+    candles: Option<&[CandleItem]>,
+) -> Vec<Candle> {
+    if period == 0 {
+        return Vec::new();
+    }
+
+    let points = merge_history_points(asset, period, history, candles);
+    compile_candles_from_history_points(&points, period, asset, false)
+}
+
+pub fn compile_candles_from_history_points(
+    points: &[HistoryPoint],
+    period: u32,
+    symbol: &str,
+    include_current: bool,
+) -> Vec<Candle> {
+    if points.is_empty() || period == 0 {
+        return Vec::new();
+    }
+
+    let period_i64 = period as i64;
+    let mut sorted_points: Vec<(i64, f64)> = points
+        .iter()
+        .filter(|point| point.time.is_finite() && point.price.is_finite())
+        .map(|point| (point.time.floor() as i64, point.price))
+        .collect();
+    sorted_points.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut candles = Vec::new();
+    let mut current_candle: Option<BaseCandle> = None;
+    let mut current_boundary_idx: Option<i64> = None;
+
+    for (timestamp, price) in sorted_points {
+        let boundary_idx = timestamp.div_euclid(period_i64);
+        let boundary = boundary_idx * period_i64;
+
+        if let Some(mut candle) = current_candle.take() {
+            if Some(boundary_idx) == current_boundary_idx {
+                candle.high = candle.high.max(price);
+                candle.low = candle.low.min(price);
+                candle.close = price;
+                current_candle = Some(candle);
+            } else {
+                match Candle::try_from((candle, symbol.to_string())) {
+                    Ok(c) => candles.push(c),
+                    Err(e) => warn!(
+                        "Failed to convert merged history candle for {}: {}",
+                        symbol, e
+                    ),
+                }
+                current_boundary_idx = Some(boundary_idx);
+                current_candle = Some(BaseCandle {
+                    timestamp: boundary,
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: None,
+                });
+            }
+        } else {
+            current_boundary_idx = Some(boundary_idx);
+            current_candle = Some(BaseCandle {
+                timestamp: boundary,
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: None,
+            });
+        }
+    }
+
+    if include_current {
+        if let Some(candle) = current_candle {
+            match Candle::try_from((candle, symbol.to_string())) {
+                Ok(c) => candles.push(c),
+                Err(e) => warn!(
+                    "Failed to convert merged history current candle for {}: {}",
+                    symbol, e
+                ),
+            }
+        }
+    }
+
+    candles
+}
 
 impl Candle {
     /// Create a new candle with initial price
@@ -701,6 +866,26 @@ mod tests {
         let ticks = vec![];
         let candles = compile_candles_from_ticks(&ticks, 60, "TEST");
         assert!(candles.is_empty());
+    }
+
+    #[test]
+    fn test_merge_history_points_matches_pocket_history_flow() {
+        let history = vec![
+            HistoryItem::Tick([105.5.into(), 1.5.into()]),
+            HistoryItem::Tick([110.0.into(), 1.6.into()]),
+        ];
+        let candles = vec![
+            CandleItem(100.0, 1.0, 1.4, 1.8, 0.9, 10.0),
+            CandleItem(110.0, 2.0, 2.4, 2.8, 1.9, 20.0),
+        ];
+
+        let points = merge_history_points("TEST", 5, Some(&history), Some(&candles));
+        let times: Vec<f64> = points.iter().map(|point| point.time).collect();
+        let prices: Vec<f64> = points.iter().map(|point| point.price).collect();
+
+        assert_eq!(times, vec![100.0, 101.0, 102.0, 104.0, 105.5, 110.0]);
+        assert_eq!(prices, vec![1.0, 1.8, 0.9, 1.4, 1.5, 1.6]);
+        assert!(points.iter().all(|point| point.asset == "TEST"));
     }
 
     #[test]

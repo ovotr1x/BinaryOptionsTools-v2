@@ -12,4 +12,5 @@ pub mod types;
 pub mod utils;
 
 pub mod pocket_client;
+pub use modules::chart_stream::{HistoryStreamEvent, HistoryStreamMode};
 pub use pocket_client::PocketOption;
