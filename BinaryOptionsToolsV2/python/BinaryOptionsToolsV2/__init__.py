@@ -46,6 +46,7 @@ _core_names = [
     "StreamLogsIterator",
     "StreamLogsLayer",
     "StreamIterator",
+    "HistoryStreamIterator",
     "RawStreamIterator",
     "start_tracing",
 ]

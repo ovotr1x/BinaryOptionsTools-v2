@@ -12,7 +12,10 @@ mod validator;
 use config::PyConfig;
 use framework::{PyBot, PyContext, PyStrategy, PyVirtualMarket};
 use logs::{start_tracing, LogBuilder, Logger, StreamLogsIterator, StreamLogsLayer};
-use pocketoption::{RawHandle, RawHandler, RawPocketOption, RawStreamIterator, StreamIterator};
+use pocketoption::{
+    HistoryStreamIterator, PointStreamIterator, RawHandle, RawHandler, RawPocketOption,
+    RawStreamIterator, StreamIterator,
+};
 use pyo3::prelude::*;
 use validator::RawValidator;
 
@@ -27,6 +30,8 @@ fn BinaryOptionsTools(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Logger>()?;
     m.add_class::<LogBuilder>()?;
     m.add_class::<StreamIterator>()?;
+    m.add_class::<PointStreamIterator>()?;
+    m.add_class::<HistoryStreamIterator>()?;
     m.add_class::<RawStreamIterator>()?;
     m.add_class::<RawValidator>()?;
     m.add_class::<RawHandle>()?;

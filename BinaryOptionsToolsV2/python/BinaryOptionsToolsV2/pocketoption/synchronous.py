@@ -483,6 +483,16 @@ class PocketOption:
         with self._lock:
             return self.loop.run_until_complete(self._client.history(asset, period))
 
+    def history_points(self, asset: str, period: int) -> List[Dict]:
+        "Returns Pocket-style merged chart points for an asset and period."
+        with self._lock:
+            return self.loop.run_until_complete(self._client.history_points(asset, period))
+
+    def history_ohlc(self, asset: str, period: int) -> List[Dict]:
+        "Returns closed OHLC candles from Pocket-style merged chart history."
+        with self._lock:
+            return self.loop.run_until_complete(self._client.history_ohlc(asset, period))
+
     def compile_candles(self, asset: str, custom_period: int, lookback_period: int) -> List[Dict]:
         """Compiles custom candlesticks from raw tick history.
 
@@ -527,6 +537,18 @@ class PocketOption:
         """Returns a sync iterator over the associated asset, it will return real time raw candles and will return new candles while the 'PocketOption' class is loaded if the class is droped then the iterator will fail"""
         with self._lock:
             return SyncSubscription(self.loop.run_until_complete(self._client._subscribe_symbol_inner(asset)))
+
+    def subscribe_points(self, asset: str) -> SyncSubscription:
+        """Returns a sync iterator over raw Pocket updateStream price points."""
+        with self._lock:
+            return SyncSubscription(self.loop.run_until_complete(self._client._subscribe_points_inner(asset)))
+
+    def subscribe_with_history_mode(self, asset: str, period: int, mode: str = "points") -> SyncSubscription:
+        """Returns a sync iterator over chart history followed by matching live updateStream rows."""
+        with self._lock:
+            return SyncSubscription(
+                self.loop.run_until_complete(self._client._subscribe_with_history_mode_inner(asset, period, mode))
+            )
 
     def subscribe_symbol_chuncked(self, asset: str, chunck_size: int) -> SyncSubscription:
         """Returns a sync iterator over the associated asset, it will return real time candles formed with the specified amount of raw candles and will return new candles while the 'PocketOption' class is loaded if the class is droped then the iterator will fail"""

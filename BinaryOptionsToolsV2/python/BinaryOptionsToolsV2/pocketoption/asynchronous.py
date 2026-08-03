@@ -790,6 +790,14 @@ class PocketOptionAsync:
         """
         return json.loads(await self.client.history(asset, period))
 
+    async def history_points(self, asset: str, period: int) -> List[Dict]:
+        """Returns Pocket-style merged chart points for an asset and period."""
+        return json.loads(await self.client.history_points(asset, period))
+
+    async def history_ohlc(self, asset: str, period: int) -> List[Dict]:
+        """Returns closed OHLC candles from Pocket-style merged chart history."""
+        return json.loads(await self.client.history_ohlc(asset, period))
+
     async def compile_candles(self, asset: str, custom_period: int, lookback_period: int) -> List[Dict]:
         """Compiles custom candlesticks from raw tick history.
 
@@ -854,6 +862,14 @@ class PocketOptionAsync:
             which wraps this method in an `AsyncSubscription` for easier handling.
         """
         return await self.client.subscribe_symbol(asset)
+
+    async def _subscribe_points_inner(self, asset: str):
+        """Internal method to subscribe to raw Pocket updateStream price points."""
+        return await self.client.subscribe_points(asset)
+
+    async def _subscribe_with_history_mode_inner(self, asset: str, period: int, mode: str = "points"):
+        """Internal method to subscribe to chart history followed by matching live updateStream rows."""
+        return await self.client.subscribe_with_history_mode(asset, period, mode)
 
     async def _subscribe_symbol_chuncked_inner(self, asset: str, chunck_size: int):
         """Internal method to establish a chunked real-time subscription for an asset.
@@ -940,6 +956,19 @@ class PocketOptionAsync:
             ```
         """
         return AsyncSubscription(await self._subscribe_symbol_inner(asset))
+
+    async def subscribe_points(self, asset: str) -> AsyncSubscription:
+        """Subscribe to raw Pocket updateStream price points for an asset."""
+        return AsyncSubscription(await self._subscribe_points_inner(asset))
+
+    async def subscribe_with_history_mode(
+        self, asset: str, period: int, mode: str = "points"
+    ) -> AsyncSubscription:
+        """Subscribe to chart history followed by live updateStream rows.
+
+        mode must be \"points\" or \"ohlc\".
+        """
+        return AsyncSubscription(await self._subscribe_with_history_mode_inner(asset, period, mode))
 
     async def subscribe_symbol_chuncked(self, asset: str, chunck_size: int) -> AsyncSubscription:
         """Returns an async iterator over the associated asset, it will return real time candles formed with the specified amount of raw candles and will return new candles while the 'PocketOptionAsync' class is loaded if the class is droped then the iterator will fail"""
