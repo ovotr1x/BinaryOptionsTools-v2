@@ -1156,7 +1156,35 @@ impl SubscriptionsApiModule {
         else {
             return;
         };
+
         let pending = self.pending_chart_streams.remove(index);
+
+        // Prevent time_aligned() from receiving a zero duration.
+        if history.period == 0 {
+            let _ = pending
+                .sender
+                .send(Err(PocketError::General(
+                    "Period must be greater than zero".to_string(),
+                )))
+                .await;
+            return;
+        }
+
+        let is_ohlc = matches!(&pending.mode, HistoryStreamMode::Ohlc);
+
+        // Create the live aggregator before emitting history. This ensures an
+        // unsupported aligned duration fails before partial history is emitted.
+        let live_ohlc = if is_ohlc {
+            match SubscriptionType::time_aligned(Duration::from_secs(history.period as u64)) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    let _ = pending.sender.send(Err(error)).await;
+                    return;
+                }
+            }
+        } else {
+            SubscriptionType::none()
+        };
 
         let points = merge_history_points(
             &history.asset,
@@ -1164,8 +1192,9 @@ impl SubscriptionsApiModule {
             history.history.as_deref(),
             history.candles.as_deref(),
         );
-        // Track the newest history timestamp so live rows that overlap the
-        // bootstrap are filtered out.
+
+        // Track the newest history timestamp so overlapping live rows are
+        // filtered out.
         let edge_time = points
             .iter()
             .map(|point| point.time)
@@ -1173,7 +1202,7 @@ impl SubscriptionsApiModule {
             .reduce(f64::max)
             .unwrap_or(f64::NEG_INFINITY);
 
-        match pending.mode {
+        match &pending.mode {
             HistoryStreamMode::Points => {
                 for point in points {
                     if pending
@@ -1182,11 +1211,12 @@ impl SubscriptionsApiModule {
                         .await
                         .is_err()
                     {
-                        // Consumer dropped the stream; abandon it silently.
+                        // Consumer dropped the stream.
                         return;
                     }
                 }
             }
+
             HistoryStreamMode::Ohlc => {
                 let candles = merge_history_ohlc(
                     &history.asset,
@@ -1194,6 +1224,7 @@ impl SubscriptionsApiModule {
                     history.history.as_deref(),
                     history.candles.as_deref(),
                 );
+
                 for candle in candles {
                     if pending
                         .sender
@@ -1212,7 +1243,7 @@ impl SubscriptionsApiModule {
             mode: pending.mode,
             edge_time,
             sender: pending.sender,
-            live_ohlc: SubscriptionType::time(Duration::from_secs(history.period as u64)),
+            live_ohlc,
         });
     }
 
@@ -1484,7 +1515,7 @@ async fn send_subscribe_message(
     ws_sender: &AsyncSender<Message>,
     asset: &str,
     period: u32,
-    subfor: bool
+    subfor: bool,
 ) -> CoreResult<()> {
     ws_sender
         .send(Message::text(
